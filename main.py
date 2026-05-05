@@ -1,293 +1,193 @@
-"""
-Main module for training and evaluating document embedding models.
-
-This module provides the main entry point for training and evaluating various document
-embedding models including UniDEC, SupConDR, and LLM. It supports both single and
-multi-GPU training using the accelerate library.
-
-Example:
-    >>> python main.py --config-name=default
-"""
-
-# Standard library imports
-import os
-import math
-import warnings
-from typing import Optional, Tuple, Any
-
-# Third-party imports
-import torch
-import torch.multiprocessing
 import numpy as np
-import scipy.sparse as sp
-from omegaconf import DictConfig
-import hydra
+import torch
+
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
-from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import set_seed
+from torch.optim import AdamW
 
-# Local application imports
-from data.preprocessing import create_data, load_data
-from data.datasets import (
-    QCDataset,
-    XMLTestDataset,
-    DocDataset,
-    BatchSampler,
-    MySampler
-)
-from trainer import Runner, ClusteringConfig
-from dense_clustering import cluster_dense_embs
+from dataset import MDataset, createDataCSV
+from model import XMLMHE
+from utils import *
+import argparse
 
-# Set multiprocessing sharing strategy
-torch.multiprocessing.set_sharing_strategy('file_system')
+parser = argparse.ArgumentParser()
+parser.add_argument('--batch', type=int, required=False, default=16)
+parser.add_argument('--update_count', type=int, required=False, default=1)
+parser.add_argument('--lr', type=float, required=False, default=0.0001)
+parser.add_argument('--seed', type=int, required=False, default=6088)
+parser.add_argument('--epoch', type=int, required=False, default=20)
+parser.add_argument('--dataset', type=str, required=False, default='eurlex4k')
+parser.add_argument('--data_path', type=str, required=False, default='/home/user/Data')
+parser.add_argument('--bert', type=str, required=False, default='bert-base')
+parser.add_argument('--bert_path', type=str, required=False, default='../NLP-Model/')
+
+# LoRA 相关参数
+parser.add_argument('--use_lora', action='store_true', help='use LoRA for Qwen model')
+parser.add_argument('--lora_rank', type=int, default=256, help='LoRA rank')
+parser.add_argument('--lora_alpha', type=int, default=256, help='LoRA alpha')
+parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRA dropout')
+# 混合精度
+parser.add_argument('--bf16', action='store_true', help='use bfloat16 mixed precision')
+
+parser.add_argument('--max_len', type=int, required=False, default=512)
+
+parser.add_argument('--valid', action='store_true')
+
+parser.add_argument('--swa', action='store_true')
+parser.add_argument('--swa_warmup', type=int, required=False, default=10)
+parser.add_argument('--swa_step', type=int, required=False, default=100)
+
+parser.add_argument('--num_group', type=int, default=0)
+parser.add_argument('--group_y_candidate_num', type=int, required=False, default=3000)
+parser.add_argument('--group_y_candidate_topk', type=int, required=False, default=10)
+
+parser.add_argument('--eval_step', type=int, required=False, default=20000)
+
+parser.add_argument('--hidden_dim', type=int, required=False, default=300)
+
+parser.add_argument('--eval_model', action='store_true')
+
+args = parser.parse_args()
 
 
-def setup_model_directory(config: DictConfig) -> str:
-    """
-    Create and return the model directory path.
+def train(model, df, label_map):
     
-    Args:
-        config: Hydra configuration object
-        
-    Returns:
-        Path to model directory
-    """
-    model_dir = os.path.join(
-        os.getcwd(),
-        'models',
-        config.model.encoder,
-        config.data.dataset,
-        config.model.version
-    )
-    os.makedirs(model_dir, exist_ok=True)
-    return model_dir
+    tokenizer = model.get_tokenizer()
 
+    print('dataset = ', args.dataset)
+    train_d = MDataset(df, 'train', tokenizer, label_map, args.max_len, group_y=group_y,
+                        candidates_num=args.group_y_candidate_num,model_name=args.bert)
+    test_d = MDataset(df, 'test', tokenizer, label_map, args.max_len, group_y=group_y,
+                        candidates_num=args.group_y_candidate_num,model_name=args.bert)
 
-def initialize_accelerator(config: DictConfig) -> Accelerator:
-    """
-    Initialize and return the accelerator for distributed training.
-    
-    Args:
-        config: Hydra configuration object
-        
-    Returns:
-        Initialized accelerator
-    """
-    ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
-    return Accelerator(
-        kwargs_handlers=[ddp_handler],
-        even_batches=False,
-        mixed_precision=config.hardware.mixed_precision
-    )
+    train_d.tokenizer = model.get_fast_tokenizer()
+    test_d.tokenizer = model.get_fast_tokenizer()
 
+    trainloader = DataLoader(train_d, batch_size=args.batch, num_workers=5,
+                                shuffle=True)
+    testloader = DataLoader(test_d, batch_size=args.batch, num_workers=5,
+                            shuffle=False)
+    if args.valid:
+        print('valid ...')
+        valid_d = MDataset(df, 'valid', tokenizer, label_map, args.max_len, group_y=group_y,
+                            candidates_num=args.group_y_candidate_num, model_name=args.bert)
+        validloader = DataLoader(valid_d, batch_size=args.batch, num_workers=0,
+                                    shuffle=False)
+   
+    model.cuda()
+    no_decay = ['bias', 'LayerNorm.weight']
 
-def load_or_create_training_order(
-    config: DictConfig,
-    accelerator: Accelerator,
-    train_dataset: QCDataset,
-    model_dir: str
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[sp.spmatrix]]:
-    """
-    Load existing training order or create a new one.
-    
-    Args:
-        config: Hydra configuration object
-        accelerator: Accelerator instance
-        train_dataset: Training dataset
-        model_dir: Model directory path
-        
-    Returns:
-        Tuple of (train_order, train_batch_sizes, cluster_matrix)
-    """
-    train_order_path = os.path.join(model_dir, "train_order.dat")
-    train_bs_path = os.path.join(model_dir, "train_batch_size.dat")
-    
-    if not accelerator.is_main_process:
-        return None, None, None
-        
-    if os.path.exists(train_order_path) and config.model.load_model:
-        accelerator.print("Loading existing training order")
-        train_order = np.memmap(train_order_path, dtype=np.int32, mode='r+', shape=(len(train_dataset),))
-        train_bs = np.memmap(train_bs_path, dtype=np.int32, mode='r+')
-        try:
-            cluster_mat = sp.load_npz(os.path.join(model_dir, "cluster_mat.npz"))
-        except (FileNotFoundError, IOError):
-            cluster_mat = None
+    # For Qwen models, use different learning rates for backbone and classification head
+    # Backbone (bert): args.lr, Classification head (l0, l1, embed): args.lr * 2
+    if 'qwen' in args.bert.lower():
+        backbone_params = []
+        backbone_params_no_decay = []
+        head_params = []
+        head_params_no_decay = []
+
+        for n, p in model.named_parameters():
+            if 'bert' in n:
+                # Backbone parameters (including LoRA)
+                if any(nd in n for nd in no_decay):
+                    backbone_params_no_decay.append(p)
+                else:
+                    backbone_params.append(p)
+            else:
+                # Classification head parameters (l0, l1, embed, etc.)
+                if any(nd in n for nd in no_decay):
+                    head_params_no_decay.append(p)
+                else:
+                    head_params.append(p)
+
+        optimizer_grouped_parameters = [
+            {'params': backbone_params, 'weight_decay': 0.01, 'lr': args.lr},
+            {'params': backbone_params_no_decay, 'weight_decay': 0.0, 'lr': args.lr},
+            {'params': head_params, 'weight_decay': 0.01, 'lr': args.lr * 2},
+            {'params': head_params_no_decay, 'weight_decay': 0.0, 'lr': args.lr * 2},
+        ]
+        print(f'Using differential learning rates: backbone={args.lr}, head={args.lr * 2}')
     else:
-        accelerator.print("Creating new training order")
-        embeddings = torch.rand(train_dataset.Y.shape[0], 64).to(accelerator.device)
-        tree_depth = int(math.log(train_dataset.Y.shape[0]/config.data.batch_size, 2))
-        
-        cluster_mat = cluster_dense_embs(
-            embeddings,
-            device=accelerator.device,
-            tree_depth=tree_depth
-        )
-        
-        embeddings = embeddings.detach().cpu().numpy()
-        del embeddings
-        
-        permuted_matrix = cluster_mat[np.random.permutation(cluster_mat.shape[0])]
-        batch_sizes = [batch.nnz for batch in permuted_matrix]
-        
-        train_bs = np.memmap(train_bs_path, dtype=np.int32, mode='w+', shape=(len(batch_sizes),))
-        train_bs[:] = batch_sizes
-        
-        train_order = np.memmap(train_order_path, dtype=np.int32, mode='w+', shape=(len(train_dataset),))
-        train_order[:] = permuted_matrix.indices
-    
-    return train_order, train_bs, cluster_mat
+        # For other models (BERT, RoBERTa, XLNet), use unified learning rate
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+        print(f'Using unified learning rate: {args.lr}')
+
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr)
 
 
-def create_dataloaders(
-    config: DictConfig,
-    train_dataset: QCDataset,
-    test_dataset: XMLTestDataset,
-    label_dataset: DocDataset,
-    doc_dataset: DocDataset,
-    train_order_path: str,
-    train_bs_path: str
-) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
-    """
-    Create and return dataloaders for training and evaluation.
-    
-    Args:
-        config: Hydra configuration object
-        train_dataset: Training dataset
-        test_dataset: Test dataset
-        label_dataset: Label dataset
-        doc_dataset: Document dataset
-        train_order_path: Path to training order file
-        train_bs_path: Path to training batch sizes file
-        
-    Returns:
-        Tuple of (train_dl, test_dl, label_dl, doc_dl)
-    """
-    train_dl = DataLoader(
-        dataset=train_dataset,
-        num_workers=config.hardware.num_workers,
-        collate_fn=train_dataset.collate_fn,
-        pin_memory=config.hardware.pin_memory,
-        batch_sampler=BatchSampler(
-            MySampler(train_dataset, train_order_path),
-            train_bs_path,
-            False
-        )
-    )
-    
-    test_dl = DataLoader(
-        dataset=test_dataset,
-        batch_size=4*config.data.batch_size,
-        shuffle=False,
-        num_workers=config.hardware.num_workers,
-        collate_fn=test_dataset.collate_fn,
-        pin_memory=config.hardware.pin_memory
-    )
-    
-    label_bs = 512 if config.model.pre_trained_model == "phi3" else config.hardware.label_batch_size
-    label_dl = DataLoader(
-        dataset=label_dataset,
-        batch_size=label_bs,
-        shuffle=False,
-        num_workers=config.hardware.num_workers,
-        collate_fn=label_dataset.collate_fn,
-        pin_memory=config.hardware.pin_memory
-    )
-    
-    doc_dl = DataLoader(
-        dataset=doc_dataset,
-        batch_size=4*config.data.batch_size,
-        shuffle=False,
-        num_workers=config.hardware.num_workers,
-        collate_fn=doc_dataset.collate_fn,
-        pin_memory=config.hardware.pin_memory
-    )
-    
-    return train_dl, test_dl, label_dl, doc_dl
+    max_only_p5 = -1
+    for epoch in range(0, args.epoch): ##
+        train_loss = model.train_epoch(epoch, trainloader, optimizer, mode='train',
+                                     eval_loader=validloader if args.valid else testloader,
+                                     eval_step=args.eval_step, log=LOG)
 
+        if args.valid:
+            ev_result = model.eval_epoch(epoch, validloader)
+        else:
+            ev_result = model.eval_epoch(epoch, testloader)
 
-@hydra.main(version_base=None, config_path=".", config_name="config")
-def main(config: DictConfig) -> None:
-    """
-    Main training function.
-    
-    Args:
-        config: Hydra configuration object
-    """
-    # Initialize accelerator
-    accelerator = initialize_accelerator(config)
-    
-    # Setup model directory
-    model_dir = setup_model_directory(config)
-    accelerator.print(f'Saving Model to: {model_dir}')
-    
-    # Set random seed
-    set_seed(config.model.seed)
-    accelerator.print(f"Initialized seed to {config.model.seed}")
-    
-    # Load or create data
-    data_path = os.path.join(config.data.dir, config.data.dataset)
-    accelerator.print(f"Loading {config.model.pre_trained_model} tokenized data")
-    
-    if config.data.create_data:
-        X_train, Y_train, X_test, Y_test, X_label, inv_prop = create_data(config)
-    else:
-        X_train, Y_train, X_test, Y_test, X_label, inv_prop = load_data(config)
-    
-    # Create datasets
-    train_dataset = QCDataset(X_train, X_label, Y_train, config)
-    test_dataset = XMLTestDataset(X_test, Y_test, data_path)
-    label_dataset = DocDataset(X_label)
-    doc_dataset = DocDataset(X_train)
-    
-    # Load or create training order
-    train_order, train_bs, cluster_mat = load_or_create_training_order(
-        config,
-        accelerator,
-        train_dataset,
-        model_dir
-    )
-    
-    accelerator.wait_for_everyone()
-    
-    # Create dataloaders
-    train_dl, test_dl, label_dl, doc_dl = create_dataloaders(
-        config,
-        train_dataset,
-        test_dataset,
-        label_dataset,
-        doc_dataset,
-        os.path.join(model_dir, "train_order.dat"),
-        os.path.join(model_dir, "train_batch_size.dat")
-    )
-    
-    # Initialize model
-    model = globals()[config.model.encoder](config)
-    
-    # Initialize runner
-    clustering_config = ClusteringConfig(
-        train_order=train_order,
-        train_batch_sizes=train_bs,
-        cluster_matrix=cluster_mat
-    )
-    runner = Runner(
-        [train_dl, test_dl, label_dl, doc_dl],
-        accelerator,
-        inv_prop,
-        clustering_config,
-        config
-    )
-    
-    # Train model
-    runner.train(model, config)
+        g_p1, g_p3, g_p5, p1, p3, p5 = ev_result
 
+        log_str = f'{epoch:>2}: {p1:.4f}, {p3:.4f}, {p5:.4f}, train_loss:{train_loss}'
+        if args.num_group>0:
+            log_str += f' {g_p1:.4f}, {g_p3:.4f}, {g_p5:.4f}'
+        if args.valid:
+            log_str += ' valid'
+        LOG.log(log_str)
+
+        if max_only_p5 < p5:
+            max_only_p5 = p5
+            model.save_model(f'models/model-{exp_name}.bin')
+
+        if epoch >= args.epoch + 5 and max_only_p5 != p5:
+            break
 
 if __name__ == '__main__':
-    # Suppress warnings
-    warnings.filterwarnings("ignore", category=FutureWarning)
-    warnings.filterwarnings("ignore", category=UserWarning)
+    init_seed(args.seed)
+    exp_name = get_exp_name(args.dataset,args.bert,args.num_group)
+    LOG = Logger('log_'+exp_name)
     
-    # Run main function
-    main()
+    print(f'load {args.dataset} dataset...')
+    df, label_map = createDataCSV(args.dataset,path=args.data_path)
+    if args.valid:
+        train_df, valid_df = train_test_split(df[df['dataType'] == 'train'],
+                                              test_size=4000,
+                                              random_state=1240)
+        df.iloc[valid_df.index.values, 2] = 'valid'
+        print('valid size', len(df[df['dataType'] == 'valid']))
 
-# python
+    print(f'load {args.dataset} dataset with '
+          f'{len(df[df.dataType =="train"])} train {len(df[df.dataType =="test"])} test with {len(label_map)} labels done')
+
+    if args.num_group>0:
+        num_classes, per_ele_classes = check_gorup(len(label_map), args.num_group)
+        group_y = get_groups_v2(len(label_map), num_classes, per_ele_classes)
+    else:
+        group_y = None
+    model = XMLMHE(n_labels=len(label_map), group_y=group_y, bert=args.bert,
+                        bert_path=args.bert_path,update_count=args.update_count,
+                        use_swa=args.swa, swa_warmup_epoch=args.swa_warmup, swa_update_step=args.swa_step,
+                        candidates_topk=args.group_y_candidate_topk,
+                        hidden_dim=args.hidden_dim)
+    
+    if args.eval_model and args.dataset in ['wiki500k', 'amazon670k','amazon3m']:
+        print(f'load models/model-{exp_name}.bin ......')
+        tokenizer = model.get_tokenizer()
+        test_d = MDataset(df, 'test', tokenizer, label_map, args.max_len, group_y=group_y,
+                           candidates_num=args.group_y_candidate_num, model_name=args.bert)
+
+        test_d.tokenizer = model.get_fast_tokenizer()
+
+        testloader = DataLoader(test_d, batch_size=args.batch, num_workers=5,
+                                shuffle=False)
+
+        model.load_state_dict(torch.load(f'models/model-{exp_name}.bin',map_location='cpu'))
+        model = model.cuda()
+
+        pred_scores, pred_labels = model.one_epoch(0, testloader, None, mode='test')
+        np.save(f'results/{exp_name}-labels.npy', np.array(pred_labels))
+        np.save(f'results/{exp_name}-scores.npy', np.array(pred_scores))
+    else:
+        train(model, df, label_map)
