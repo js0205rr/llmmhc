@@ -1,0 +1,81 @@
+# @package _global_
+
+# Data configuration
+data:
+  batch_size: ${oc.env:BATCH_SIZE,32}  # Can be overridden by environment variable
+  num_processes: ${oc.env:NUM_PROCESSES,1}
+  label_pool_size: 100
+  dir: "/nfs/data/skharbanda/"
+  dataset: "LF-AmazonTitles-131K"
+  create_data: false
+  fill_batch_gap: 100
+  shortlist_size: 100
+
+# Model configuration
+model:
+  encoder: ${oc.env:ENCODER,"UniDEC"}  # Options: ["UniDEC", "SupConDR"]
+  pre_trained_model: "bert-base-uncased"
+  hidden_dim: 768
+  contrastive_dim: 128
+  temperature: 0.07
+  loss_lambda: 0.5
+  add_dual_loss: false
+  CLF_loss: "bce"  # Options: ["bce", "supcon"]
+  hidden_dims: 384
+  contrastive_dims: 384
+  learning_rate: 1e-4
+  num_epochs: 150
+  eval_step: 5
+  version: ""
+  load_model: ""
+  test: false
+  seed: 29
+
+# Training configuration
+training:
+  num_epochs: 10
+  learning_rate: 2e-5
+  num_negs: 0
+  update_pos: -1
+  num_pos: 3
+  rebatch: false
+  re_hnm: false
+  add_bce_loss: false
+  score_fusion: false
+  fill_batch: false
+  de_loss: "supcon"
+  clf_loss: null
+  add_dual_loss: false
+  add_dual_clf_loss: false
+
+# Clustering configuration
+clustering:
+  start_epoch: 5
+  update_interval: 5
+  update_frequency: 5
+  rebatch: false
+  re_hnm: false
+
+# Evaluation configuration
+evaluation:
+  eval_interval: 1
+  test: false
+  score_fusion: false
+  shortlist_size: 100
+
+# Checkpoint configuration
+checkpoint:
+  version: "v1"
+
+# Defaults for command line arguments
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+# Hardware configuration
+hardware:
+  num_workers: 4
+  label_batch_size: 8192  # Will be 512 for phi3 model
+  mixed_precision: "bf16"
+  pin_memory: true 

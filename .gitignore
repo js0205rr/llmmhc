@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Model checkpoints and data
+*.pt
+*.pth
+*.bin
+*.npz
+*.dat
+*.memmap
+
+# Logs
+*.log
+wandb/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Downloaded files
+*.pdf
