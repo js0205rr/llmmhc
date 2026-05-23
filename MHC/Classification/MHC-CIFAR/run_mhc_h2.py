@@ -1,10 +1,5 @@
 #!/usr/bin/env python
-"""
-@author : Daojun Liang
-@email  : daojunliang@gmail.com
-@time   : 2020/9/21 23:40
-@desc   : __init__.py.py
-"""
+
 from __future__ import print_function
 
 import argparse
