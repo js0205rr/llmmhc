@@ -1,21 +1,4 @@
-# UniDEC: Unified Dual Encoder and Classifier Training for Extreme Multi-Label Classification
-
-UniDEC is a unified training framework that combines dual encoders and classifiers for extreme multi-label classification (XMC). It achieves **4-16x reduction** in computational costs while maintaining state-of-the-art performance on million-scale label datasets.
-
-## Key Contributions
-
-- **Pick-Some-Labels (PSL) Reduction**: Strategically samples positive and negative labels during training, reducing the label pool from millions to thousands per batch
-- **Unified Training**: Jointly trains dual encoders and classifiers using multi-class loss rather than one-vs-all approaches
-- **Single GPU Training**: Achieves near-SOTA results on a single 48GB GPU where competitors require 8-16 high-end GPUs
-- **Loss-Independent Framework**: Supports multiple loss functions (SupCon, Balanced-SupCon, Decoupled-SupCon)
-
-## Installation
-
-```bash
-git clone https://github.com/the-catalyst/UniDEC.git
-cd UniDEC
-pip install -r requirements.txt
-```
+# ProPa
 
 ## Project Structure
 
